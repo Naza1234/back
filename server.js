@@ -6,7 +6,7 @@ const path = require('path');
 const cors = require('cors');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000; // Make PORT flexible for deployment
 
 // Enable CORS for all origins
 app.use(cors());
@@ -26,8 +26,8 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
   fileFilter: (req, file, cb) => {
-    // Only accept .webm files
     if (file.mimetype === 'video/webm') {
       cb(null, true);
     } else {
@@ -37,33 +37,62 @@ const upload = multer({
 });
 
 app.post('/convert', upload.single('video'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).send('No file uploaded.');
+  }
+
   const inputPath = path.join(__dirname, 'uploads', req.file.filename);
   const outputFilename = `${Date.now()}-output.mp4`;
   const outputPath = path.join(__dirname, 'converted', outputFilename);
 
-  // Set headers first before doing any processing or streaming
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename=${outputFilename}`);
-
   // Convert the video using ffmpeg
   ffmpeg(inputPath)
-    .outputOptions(['-c:v libx264', '-c:a aac'])
+    .outputOptions([
+      '-c:v libx264', 
+      '-c:a aac',
+      '-preset veryfast', // Faster compression
+      '-crf 28',           // Lower quality, smaller size
+      '-movflags +faststart' // Optimized for streaming
+    ])
     .on('end', () => {
-      // After the conversion ends, create the stream and pipe to the response
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
+      
       const readStream = fs.createReadStream(outputPath);
       readStream.pipe(res);
 
-      // Cleanup temp files after response is finished
       readStream.on('close', () => {
-        fs.unlinkSync(inputPath);
-        fs.unlinkSync(outputPath);
+        // Cleanup temp files after sending
+        fs.unlink(inputPath, (err) => {
+          if (err) console.error('Failed to delete input file:', err);
+        });
+        fs.unlink(outputPath, (err) => {
+          if (err) console.error('Failed to delete output file:', err);
+        });
       });
     })
     .on('error', err => {
       console.error('FFmpeg error:', err);
       res.status(500).send('Video conversion failed.');
+
+      // Clean up input if FFmpeg fails
+      fs.unlink(inputPath, (unlinkErr) => {
+        if (unlinkErr) console.error('Failed to delete input after ffmpeg error:', unlinkErr);
+      });
     })
-    .save(outputPath);  // Save the converted video to outputPath
+    .save(outputPath);
+});
+
+// Handle Multer file size errors
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).send('File too large. Max size is 10MB.');
+    }
+  } else if (err) {
+    return res.status(400).send(err.message);
+  }
+  next();
 });
 
 app.listen(PORT, () => {
